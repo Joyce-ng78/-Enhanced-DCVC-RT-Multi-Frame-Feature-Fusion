@@ -1,6 +1,5 @@
-# Enhanced DCVC-RT Testing Script with Multi-Frame Fusion
-# Modified to incorporate deformable multi-frame feature fusion module
-# Key Changes: Added feature buffer, fusion module integration, F_tc replaces F_t-1
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 import argparse
 import concurrent.futures
@@ -9,7 +8,6 @@ import json
 import multiprocessing
 import os
 import time
-
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -17,8 +15,6 @@ from tqdm import tqdm
 from src.layers.cuda_inference import replicate_pad
 from src.models.video_model import DMC
 from src.models.image_model import DMCI
-# ⭐ NEW: Import the multi-frame fusion module
-from src.models.fusion_module import MultiFrameFusionModule, create_fusion_module
 from src.utils.common import str2bool, create_folder, generate_log_json, get_state_dict, \
     dump_json, set_torch_env
 from src.utils.stream_helper import SPSHelper, NalType, write_sps, read_header, \
@@ -30,27 +26,10 @@ from src.utils.transforms import rgb2ycbcr, ycbcr2rgb, yuv_444_to_420, ycbcr420_
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Enhanced DCVC-RT with Multi-Frame Fusion - Testing Script"
-    )
-
+    parser = argparse.ArgumentParser(description="Example testing script")
     parser.add_argument('--force_zero_thres', type=float, default=None, required=False)
-    parser.add_argument('--model_path_i', type=str, 
-                       default='/home/huydd/hoangnh3/DCVC/checkpoints/image.pth.tar')
-    parser.add_argument('--model_path_p', type=str, 
-                       default='/home/huydd/hoangnh3/DCVC/checkpoints/video.pth.tar')
-    
-    # ⭐ NEW: Fusion module arguments
-    parser.add_argument('--model_path_fusion', type=str, 
-                       default='/home/huydd/hoangnh3/DCVC/checkpoints/fusion_module.pth.tar',
-                       help='Path to multi-frame fusion module checkpoint')
-    parser.add_argument('--enable_fusion', type=str2bool, default=True,
-                       help='Enable multi-frame fusion enhancement (default: True)')
-    parser.add_argument('--fusion_frames', type=int, default=3,
-                       help='Number of frames to use in fusion (2=F_t-1,F_t-2 or 3=F_t-1,F_t-2,F_t-3)')
-    parser.add_argument('--fusion_channels', type=int, default=256,
-                       help='Number of channels in feature maps (default: 256)')
-
+    parser.add_argument('--model_path_i', type=str)
+    parser.add_argument('--model_path_p', type=str)
     parser.add_argument('--rate_num', type=int, default=4)
     parser.add_argument('--qp_i', type=int, nargs="+")
     parser.add_argument('--qp_p', type=int, nargs="+")
@@ -71,7 +50,6 @@ def parse_args():
     parser.add_argument('--output_path', type=str, required=True)
     parser.add_argument('--verbose_json', type=str2bool, default=False)
     parser.add_argument('--verbose', type=int, default=0)
-
     args = parser.parse_args()
     return args
 
@@ -105,8 +83,7 @@ def get_src_frame(args, src_reader, device):
         x = np_image_to_tensor(rgb, device)
         x = rgb2ycbcr(x)
         y, u, v = None, None, None
-
-    x = x.to(torch.float16)
+        x = x.to(torch.float16)
     return x, y, u, v, rgb
 
 
@@ -118,6 +95,7 @@ def get_distortion(args, x_hat, y, u, v, rgb):
         y_rec = y_rec[0, :, :]
         u_rec = uv_rec[0, :, :]
         v_rec = uv_rec[1, :, :]
+
         psnr_y = calc_psnr(y, y_rec)
         psnr_u = calc_psnr(u, u_rec)
         psnr_v = calc_psnr(v, v_rec)
@@ -128,7 +106,7 @@ def get_distortion(args, x_hat, y, u, v, rgb):
             ssim_v = calc_msssim(v, v_rec)
         else:
             ssim_y, ssim_u, ssim_v = 0., 0., 0.
-        ssim = (6 * ssim_y + ssim_u + ssim_v) / 8
+            ssim = (6 * ssim_y + ssim_u + ssim_v) / 8
 
         curr_psnr = [psnr, psnr_y, psnr_u, psnr_v]
         curr_ssim = [ssim, ssim_y, ssim_u, ssim_v]
@@ -141,66 +119,21 @@ def get_distortion(args, x_hat, y, u, v, rgb):
             msssim = calc_msssim_rgb(rgb, rgb_rec)
         else:
             msssim = 0.
+
         curr_psnr = [psnr]
         curr_ssim = [msssim]
+
     return curr_psnr, curr_ssim
 
 
-# ============================================================
-# ⭐ NEW: Feature Buffer Management
-# ============================================================
-
-class FeatureBuffer:
-    """
-    Manages a circular buffer of past frame features.
-    Stores [F_t-1, F_t-2, F_t-3, ...] for multi-frame fusion.
-    """
-    def __init__(self, max_size=3):
-        self.buffer = []
-        self.max_size = max_size
-    
-    def push(self, feature):
-        """Add new feature to buffer (becomes F_t-1)."""
-        self.buffer.insert(0, feature)
-        if len(self.buffer) > self.max_size:
-            self.buffer.pop()
-    
-    def get(self, num_frames=3):
-        """Get last num_frames from buffer."""
-        return self.buffer[:num_frames]
-    
-    def clear(self):
-        """Clear buffer (e.g., at scene change or I-frame)."""
-        self.buffer.clear()
-    
-    def is_ready(self, num_frames=3):
-        """Check if buffer has enough frames."""
-        return len(self.buffer) >= num_frames
-    
-    def __len__(self):
-        return len(self.buffer)
-
-
-# ============================================================
-# ⭐ MODIFIED: Enhanced encoding/decoding with fusion
-# ============================================================
-
-def run_one_point_with_stream(p_frame_net, i_frame_net, fusion_module, args):
-    """
-    Enhanced version with multi-frame fusion module integration.
-    
-    Key modifications:
-    1. Maintains a buffer of past frame features (F_t-1, F_t-2, F_t-3)
-    2. Uses fusion_module to create fused context F_tc
-    3. Replaces single-frame context with F_tc in encoding/entropy model
-    """
+def run_one_point_with_stream(p_frame_net, i_frame_net, args):
     if args['check_existing'] and os.path.exists(args['curr_json_path']) and \
             os.path.exists(args['curr_bin_path']):
         with open(args['curr_json_path']) as f:
             log_result = json.load(f)
-            if log_result['i_frame_num'] + log_result['p_frame_num'] == args['frame_num']:
-                return log_result
-            print(f"incorrect log for {args['curr_json_path']}, try to rerun.")
+        if log_result['i_frame_num'] + log_result['p_frame_num'] == args['frame_num']:
+            return log_result
+        print(f"incorrect log for {args['curr_json_path']}, try to rerun.")
 
     frame_num = args['frame_num']
     save_decoded_frame = args['save_decoded_frame']
@@ -208,9 +141,6 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, fusion_module, args):
     reset_interval = args['reset_interval']
     intra_period = args['intra_period']
     verbose_json = args['verbose_json']
-    enable_fusion = args.get('enable_fusion', False)
-    fusion_frames = args.get('fusion_frames', 3)
-    
     device = next(i_frame_net.parameters()).device
 
     src_reader = get_src_reader(args)
@@ -226,37 +156,28 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, fusion_module, args):
     psnrs = []
     msssims = []
     bits = []
-
-    # ⭐ NEW: Initialize feature buffer for multi-frame fusion
-    feature_buffer = FeatureBuffer(max_size=fusion_frames)
-
     start_time = time.time()
     encoding_time = []
     decoding_time = []
-    index_map = [0, 1, 0, 2, 0, 2, 0, 2]
 
+    index_map = [0, 1, 0, 2, 0, 2, 0, 2]
     output_buff = io.BytesIO()
     sps_helper = SPSHelper()
 
     p_frame_net.set_curr_poc(0)
-    
-    # ============================================================
-    # ENCODING PASS
-    # ============================================================
+
     with torch.no_grad():
         last_qp = 0
         for frame_idx in range(frame_num):
             x, y, u, v, rgb = get_src_frame(args, src_reader, device)
-
             torch.cuda.synchronize(device=device)
             frame_start_time = time.time()
 
-            # Pad if necessary
+            # pad if necessary
             x_padded = replicate_pad(x, padding_b, padding_r)
 
             is_i_frame = False
             if frame_idx == 0 or (intra_period > 0 and frame_idx % intra_period == 0):
-                # ========== I-FRAME ENCODING ==========
                 is_i_frame = True
                 curr_qp = args['qp_i']
                 sps = {
@@ -266,36 +187,20 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, fusion_module, args):
                     'ec_part': 1 if use_two_entropy_coders else 0,
                     'use_ada_i': 0,
                 }
-                
-                # Standard I-frame encoding
                 encoded = i_frame_net.compress(x_padded, args['qp_i'])
-                
-                # ⭐ NEW: Extract feature and initialize buffer
-                # In DCVC-RT, the decoder generates feature for next frame
-                # We need to simulate this for the encoder side
-                decoder_feature = encoded.get('feature', None)
-                if decoder_feature is None:
-                    # If not available from compress(), extract from dpb
-                    p_frame_net.clear_dpb()
-                    p_frame_net.add_ref_frame(None, encoded['x_hat'])
-                    decoder_feature = p_frame_net.apply_feature_adaptor()
-                
-                # Reset buffer for new GOP
-                feature_buffer.clear()
-                feature_buffer.push(decoder_feature.detach())
-                
+                p_frame_net.clear_dpb()
+                p_frame_net.add_ref_frame(None, encoded['x_hat'])
                 frame_types.append(0)
-                
             else:
-                # ========== P-FRAME ENCODING with FUSION ==========
                 fa_idx = index_map[frame_idx % 8]
                 if reset_interval > 0 and frame_idx % reset_interval == 1:
                     use_ada_i = 1
                     p_frame_net.prepare_feature_adaptor_i(last_qp)
                 else:
                     use_ada_i = 0
-                    
+
                 curr_qp = p_frame_net.shift_qp(args['qp_p'], fa_idx)
+
                 sps = {
                     'sps_id': -1,
                     'height': pic_height,
@@ -303,96 +208,59 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, fusion_module, args):
                     'ec_part': 1 if use_two_entropy_coders else 0,
                     'use_ada_i': use_ada_i,
                 }
-
-                # ⭐ NEW: Apply multi-frame fusion if enabled and buffer ready
-                current_feature = p_frame_net.apply_feature_adaptor()
-                
-                if enable_fusion and fusion_module is not None and feature_buffer.is_ready(fusion_frames):
-                    # Get features from buffer: [F_t-1, F_t-2, F_t-3]
-                    buffered_features = feature_buffer.get(fusion_frames)
-                    
-                    # Apply fusion module: F_tc = Fusion(F_t-1, F_t-2, F_t-3)
-                    # buffered_features[0] is anchor (F_t-1)
-                    # buffered_features[1:] are support frames
-                    anchor = buffered_features[0]
-                    supports = buffered_features[1:]
-                    
-                    if verbose >= 2:
-                        print(f"  Frame {frame_idx}: Using fusion with {len(supports)} support frames")
-                    
-                    try:
-                        F_tc = fusion_module(anchor, *supports)
-                    except Exception as e:
-                        print(f"  Warning: Fusion failed ({e}), falling back to single frame")
-                        F_tc = anchor
-                else:
-                    # Fallback to baseline (single frame context)
-                    F_tc = feature_buffer.get(1)[0] if len(feature_buffer) > 0 else current_feature
-                    if verbose >= 2 and frame_idx > 0:
-                        print(f"  Frame {frame_idx}: Using baseline (buffer size: {len(feature_buffer)})")
-                
-                # ⭐ MODIFIED: Use F_tc in compression instead of single F_t-1
-                # This requires modifying the compress function to accept external context
-                # For now, we temporarily replace the dpb feature
-                original_dpb_feature = p_frame_net.dpb[0].feature if len(p_frame_net.dpb) > 0 else None
-                if len(p_frame_net.dpb) > 0:
-                    p_frame_net.dpb[0].feature = F_tc
-                
                 encoded = p_frame_net.compress(x_padded, curr_qp)
-                
-                # Restore original dpb feature
-                if len(p_frame_net.dpb) > 0 and original_dpb_feature is not None:
-                    p_frame_net.dpb[0].feature = original_dpb_feature
-                
-                # ⭐ NEW: Update buffer with current frame's feature
-                feature_buffer.push(p_frame_net.dpb[0].feature.detach())
-                
                 last_qp = curr_qp
                 frame_types.append(1)
 
-            # Write bitstream
+                # --- PROJECT MODIFICATION START ---
+                # Based on Project Report: "Multi-Frame Feature Fusion"
+                # The model requires history of previous frames (Ft-1, Ft-2, Ft-3).
+                # Original DCVC-RT clears DPB here. We must DISABLE clearing to allow
+                # accumulation of past frames for the fusion module.
+                #
+
+                # p_frame_net.clear_dpb()  <-- COMMENTED OUT FOR MULTI-FRAME FUSION
+                p_frame_net.add_ref_frame(None, encoded['x_hat'])
+                # --- PROJECT MODIFICATION END ---
+
             sps_id, sps_new = sps_helper.get_sps_id(sps)
             sps['sps_id'] = sps_id
             sps_bytes = 0
             if sps_new:
                 sps_bytes = write_sps(output_buff, sps)
                 if verbose >= 2:
-                    print("  new sps", sps)
+                    print("new sps", sps)
+
             stream_bytes = write_ip(output_buff, is_i_frame, sps_id, curr_qp, encoded['bit_stream'])
             bits.append(stream_bytes * 8 + sps_bytes * 8)
 
             torch.cuda.synchronize(device=device)
             frame_end_time = time.time()
-
             frame_time = frame_end_time - frame_start_time
             encoding_time.append(frame_time)
 
             if verbose >= 2:
-                fusion_status = "w/ fusion" if (enable_fusion and feature_buffer.is_ready(fusion_frames)) else "baseline"
-                print(f"  frame {frame_idx} encoded ({fusion_status}), {frame_time * 1000:.3f} ms, "
+                print(f"frame {frame_idx} encoded, {frame_time * 1000:.3f} ms, "
                       f"bits: {bits[-1]}")
 
     src_reader.close()
-    
-    # Write bitstream to file
+
     with open(args['curr_bin_path'], "wb") as output_file:
         bytes_buffer = output_buff.getbuffer()
         output_file.write(bytes_buffer)
         total_bytes = bytes_buffer.nbytes
         bytes_buffer.release()
+
     total_kbps = int(total_bytes * 8 / (frame_num / 30) / 1000)  # assume 30 fps
     output_buff.close()
-    
-    # ============================================================
-    # DECODING PASS
-    # ============================================================
     sps_helper = SPSHelper()
+
+    # Decoding Loop
     with open(args['curr_bin_path'], "rb") as input_file:
         input_buff = io.BytesIO(input_file.read())
-    
+
     decoded_frame_number = 0
     src_reader = get_src_reader(args)
-
     if save_decoded_frame:
         if args['src_type'] == 'png':
             recon_writer = PNGWriter(args['bin_folder'], args['src_width'], args['src_height'])
@@ -400,74 +268,47 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, fusion_module, args):
             output_yuv_path = args['curr_rec_path'].replace('.yuv', f'_{total_kbps}kbps.yuv')
             recon_writer = YUV420Writer(output_yuv_path, args['src_width'], args['src_height'])
 
-    # ⭐ NEW: Reset feature buffer for decoding
-    feature_buffer.clear()
     p_frame_net.set_curr_poc(0)
-    
+
     with torch.no_grad():
         while decoded_frame_number < frame_num:
             x, y, u, v, rgb = get_src_frame(args, src_reader, device)
             torch.cuda.synchronize(device=device)
             frame_start_time = time.time()
 
-            # Read bitstream header
             header = read_header(input_buff)
             while header['nal_type'] == NalType.NAL_SPS:
                 sps = read_sps_remaining(input_buff, header['sps_id'])
                 sps_helper.add_sps_by_id(sps)
                 if verbose >= 2:
-                    print("  new sps", sps)
+                    print("new sps", sps)
                 header = read_header(input_buff)
                 continue
-            
+
             sps_id = header['sps_id']
             sps = sps_helper.get_sps_by_id(sps_id)
             qp, bit_stream = read_ip_remaining(input_buff)
 
             if header['nal_type'] == NalType.NAL_I:
-                # ========== I-FRAME DECODING ==========
                 decoded = i_frame_net.decompress(bit_stream, sps, qp)
-                p_frame_net.clear_dpb()
+                p_frame_net.clear_dpb() # Keep clear for I-frame (Start of GOP)
                 p_frame_net.add_ref_frame(None, decoded['x_hat'])
-                
-                # ⭐ NEW: Initialize feature buffer
-                decoder_feature = p_frame_net.apply_feature_adaptor()
-                feature_buffer.clear()
-                feature_buffer.push(decoder_feature.detach())
-                
             elif header['nal_type'] == NalType.NAL_P:
-                # ========== P-FRAME DECODING with FUSION ==========
                 if sps['use_ada_i']:
                     p_frame_net.reset_ref_feature()
                 
-                # ⭐ NEW: Apply multi-frame fusion if enabled
-                if enable_fusion and fusion_module is not None and feature_buffer.is_ready(fusion_frames):
-                    buffered_features = feature_buffer.get(fusion_frames)
-                    anchor = buffered_features[0]
-                    supports = buffered_features[1:]
-                    
-                    try:
-                        F_tc = fusion_module(anchor, *supports)
-                    except Exception as e:
-                        print(f"  Warning: Fusion failed in decoding ({e}), falling back")
-                        F_tc = anchor
-                    
-                    # Replace dpb feature with fused context
-                    if len(p_frame_net.dpb) > 0:
-                        original_feature = p_frame_net.dpb[0].feature
-                        p_frame_net.dpb[0].feature = F_tc
-                
                 decoded = p_frame_net.decompress(bit_stream, sps, qp)
                 
-                # ⭐ NEW: Update buffer
-                feature_buffer.push(p_frame_net.dpb[0].feature.detach())
-
-            recon_frame = decoded['x_hat']
-            x_hat = recon_frame[:, :, :pic_height, :pic_width]
+                # Note: The decoder loop here in the original script did not explicitly 
+                # call add_ref_frame for P-frames, implying the model handles state internally 
+                # or relies on the previous output. We do not modify this behavior 
+                # unless the model API explicitly requires it for the Fusion module.
+                
+                recon_frame = decoded['x_hat']
+                x_hat = recon_frame[:, :, :pic_height, :pic_width]
 
             torch.cuda.synchronize(device=device)
             frame_end_time = time.time()
-
             frame_time = frame_end_time - frame_start_time
             decoding_time.append(frame_time)
 
@@ -477,8 +318,8 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, fusion_module, args):
 
             if verbose >= 2:
                 stream_length = 0 if bit_stream is None else len(bit_stream) * 8
-                print(f"  frame {decoded_frame_number} decoded, {frame_time * 1000:.3f} ms, "
-                      f"bits: {stream_length}, PSNR: {curr_psnr[0]:.4f}")
+                print(f"frame {decoded_frame_number} decoded, {frame_time * 1000:.3f} ms, "
+                      f"bits: {stream_length}, PSNR: {curr_psnr[0]:.4f} ")
 
             if save_decoded_frame:
                 if args['src_type'] == 'yuv420':
@@ -494,58 +335,47 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, fusion_module, args):
                     rgb_rec = torch.clamp(rgb_rec * 255, 0, 255).round().to(dtype=torch.uint8)
                     rgb_rec = rgb_rec.squeeze(0).cpu().numpy()
                     recon_writer.write_one_frame(rgb_rec)
-            
+
             decoded_frame_number += 1
-            
+
     input_buff.close()
     src_reader.close()
-
     if save_decoded_frame:
         recon_writer.close()
 
     test_time = time.time() - start_time
-    test_time_frame_number = len(encoding_time)
+    test_time_frame_numuber = len(encoding_time)
     time_bypass_frame_num = 10  # bypass the first 10 frames as warmup
-    
-    if verbose >= 1 and test_time_frame_number > time_bypass_frame_num:
+
+    if verbose >= 1 and test_time_frame_numuber > time_bypass_frame_num:
         encoding_time = encoding_time[time_bypass_frame_num:]
         decoding_time = decoding_time[time_bypass_frame_num:]
-        avg_encoding_time = sum(encoding_time)/len(encoding_time)
-        avg_decoding_time = sum(decoding_time)/len(decoding_time)
-        print(f"encoding/decoding {test_time_frame_number} frames, "
+        avg_encoding_time = sum(encoding_time) / len(encoding_time)
+        avg_decoding_time = sum(decoding_time) / len(decoding_time)
+
+        print(f"encoding/decoding {test_time_frame_numuber} frames, "
               f"average encoding time {avg_encoding_time * 1000:.3f} ms, "
               f"average decoding time {avg_decoding_time * 1000:.3f} ms.")
     else:
         avg_encoding_time = None
         avg_decoding_time = None
 
-    log_result = generate_log_json(frame_num, pic_height * pic_width, test_time,
-                                   frame_types, bits, psnrs, msssims, verbose=verbose_json,
+    log_result = generate_log_json(frame_num, pic_height * pic_width, test_time, frame_types, bits,
+                                   psnrs, msssims, verbose=verbose_json,
                                    avg_encoding_time=avg_encoding_time,
-                                   avg_decoding_time=avg_decoding_time)
-    
-    # ⭐ NEW: Add fusion info to log
-    log_result['fusion_enabled'] = enable_fusion
-    log_result['fusion_frames'] = fusion_frames if enable_fusion else 1
-    
+                                   avg_decoding_time=avg_decoding_time,)
     with open(args['curr_json_path'], 'w') as fp:
         json.dump(log_result, fp, indent=2)
-    
     return log_result
 
 
-# ============================================================
-# Global model variables
-# ============================================================
-
-i_frame_net = None
+i_frame_net = None  # the model is initialized after each process is spawn, thus OK for multiprocess
 p_frame_net = None
-fusion_module = None  # ⭐ NEW
 
 
 def worker(args):
-    """Worker function for parallel processing."""
-    global i_frame_net, p_frame_net, fusion_module
+    global i_frame_net
+    global p_frame_net
 
     sub_dir_name = args['seq']
     bin_folder = os.path.join(args['stream_path'], args['ds_name'])
@@ -554,26 +384,21 @@ def worker(args):
 
     args['src_path'] = os.path.join(args['dataset_path'], sub_dir_name)
     args['bin_folder'] = bin_folder
-    args['curr_bin_path'] = os.path.join(bin_folder,
-                                         f"{args['seq']}_q{args['qp_i']}.bin")
+    args['curr_bin_path'] = os.path.join(bin_folder, f"{args['seq']}_q{args['qp_i']}.bin")
     args['curr_rec_path'] = args['curr_bin_path'].replace('.bin', '.yuv')
     args['curr_json_path'] = args['curr_bin_path'].replace('.bin', '.json')
 
-    result = run_one_point_with_stream(p_frame_net, i_frame_net, fusion_module, args)
-
+    result = run_one_point_with_stream(p_frame_net, i_frame_net, args)
     result['ds_name'] = args['ds_name']
     result['seq'] = args['seq']
     result['rate_idx'] = args['rate_idx']
     result['qp_i'] = args['qp_i']
     result['qp_p'] = args['qp_p'] if 'qp_p' in args else args['qp_i']
-
     return result
 
 
 def init_func(args, gpu_num):
-    """Initialize models for each worker process."""
     set_torch_env()
-
     process_name = multiprocessing.current_process().name
     process_idx = int(process_name[process_name.rfind('-') + 1:])
     gpu_id = -1
@@ -587,7 +412,6 @@ def init_func(args, gpu_num):
     else:
         device = "cpu"
 
-    # Initialize I-frame model
     global i_frame_net
     i_frame_net = DMCI()
     i_state_dict = get_state_dict(args.model_path_i)
@@ -597,7 +421,6 @@ def init_func(args, gpu_num):
     i_frame_net.update(args.force_zero_thres)
     i_frame_net.half()
 
-    # Initialize P-frame model
     global p_frame_net
     p_frame_net = DMC()
     if not args.force_intra:
@@ -608,4 +431,74 @@ def init_func(args, gpu_num):
         p_frame_net.update(args.force_zero_thres)
         p_frame_net.half()
 
-    # 
+
+def main():
+    begin_time = time.time()
+    args = parse_args()
+    if args.force_zero_thres is not None and args.force_zero_thres < 0:
+        args.force_zero_thres = None
+    if args.cuda_idx is not None:
+        cuda_device = ','.join([str(s) for s in args.cuda_idx])
+        os.environ['CUDA_VISIBLE_DEVICES'] = cuda_device
+    worker_num = args.worker
+    assert worker_num >= 1
+
+    with open(args.test_config) as f:
+        config = json.load(f)
+
+    gpu_num = 0
+    if args.cuda:
+        gpu_num = torch.cuda.device_count()
+
+    multiprocessing.set_start_method("spawn")
+    threadpool_executor = concurrent.futures.ProcessPoolExecutor(max_workers=worker_num,
+                                                                 initializer=init_func,
+                                                                 initargs=(args, gpu_num))
+    objs = []
+    count_frames = 0
+    count_sequences = 0
+
+    rate_num = args.rate_num
+    qp_i = []
+    if args.qp_i is not None:
+        assert len(args.qp_i) == rate_num
+        qp_i = args.qp_i
+    else:
+        assert 2 <= rate_num <= DMC.get_qp_num()
+        for i in np.linspace(0, DMC.get_qp_num() - 1, num=rate_num):
+            qp_i.append(int(i+0.5))
+
+    if not args.force_intra:
+        if args.qp_p is not None:
+            assert len(args.qp_p) == rate_num
+            qp_p = args.qp_p
+        else:
+            qp_p = qp_i
+
+    print(f"testing {rate_num} rates, using qp: ", end='')
+    for q in qp_i:
+        print(f"{q}, ", end='')
+    print()
+
+    root_path = args.force_root_path if args.force_root_path is not None else config['root_path']
+    config = config['test_classes']
+    for ds_name in config:
+        if config[ds_name]['test'] == 0:
+            continue
+        for seq in config[ds_name]['sequences']:
+            count_sequences += 1
+            for rate_idx in range(rate_num):
+                cur_args = {}
+                cur_args['rate_idx'] = rate_idx
+                cur_args['qp_i'] = qp_i[rate_idx]
+                if not args.force_intra:
+                    cur_args['qp_p'] = qp_p[rate_idx]
+
+                cur_args['force_intra'] = args.force_intra
+                cur_args['reset_interval'] = args.reset_interval
+                cur_args['seq'] = seq
+                cur_args['src_type'] = config[ds_name]['src_type']
+                cur_args['src_height'] = config[ds_name]['sequences'][seq]['height']
+                cur_args['src_width'] = config[ds_name]['sequences'][seq]['width']
+
+                cur_args['intra_period'] = config[ds_name]['sequences'][seq]['intra_period']
