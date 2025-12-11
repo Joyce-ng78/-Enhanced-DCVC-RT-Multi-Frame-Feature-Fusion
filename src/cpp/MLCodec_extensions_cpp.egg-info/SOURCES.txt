@@ -1,0 +1,8 @@
+setup.py
+MLCodec_extensions_cpp.egg-info/PKG-INFO
+MLCodec_extensions_cpp.egg-info/SOURCES.txt
+MLCodec_extensions_cpp.egg-info/dependency_links.txt
+MLCodec_extensions_cpp.egg-info/not-zip-safe
+MLCodec_extensions_cpp.egg-info/top_level.txt
+py_rans/py_rans.cpp
+py_rans/rans.cpp
