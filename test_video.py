@@ -99,6 +99,7 @@ def get_distortion(args, x_hat, y, u, v, rgb):
         psnr_y = calc_psnr(y, y_rec)
         psnr_u = calc_psnr(u, u_rec)
         psnr_v = calc_psnr(v, v_rec)
+        
         psnr = (6 * psnr_y + psnr_u + psnr_v) / 8
         if args['calc_ssim']:
             ssim_y = calc_msssim(y, y_rec)
