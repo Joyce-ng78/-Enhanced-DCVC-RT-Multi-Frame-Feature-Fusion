@@ -38,6 +38,7 @@ The file `src/models/video_model.py` includes three major updates to support thi
 3.  **`DMC` Class Updates**:
     * **Buffer Size:** `self.max_dpb_size` increased to **3** to store $F_{t-1}$ through $F_{t-3}$.
     * **Compression Loop:** Calls `get_fused_context()` to generate $F_{tc}$ before entropy coding.
+    
 Checkpoints: https://drive.google.com/drive/folders/1Y0eSk_HLBnm3el9theUJ6iufyhiev8UB?usp=drive_link
 
 
