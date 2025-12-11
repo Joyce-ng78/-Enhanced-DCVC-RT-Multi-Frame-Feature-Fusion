@@ -217,7 +217,7 @@ def run_one_point_with_stream(p_frame_net, i_frame_net, args):
                 # The model requires history of previous frames (Ft-1, Ft-2, Ft-3).
                 # Original DCVC-RT clears DPB here. We must DISABLE clearing to allow
                 # accumulation of past frames for the fusion module.
-                #
+                # [cite: 63, 64, 148]
 
                 # p_frame_net.clear_dpb()  <-- COMMENTED OUT FOR MULTI-FRAME FUSION
                 p_frame_net.add_ref_frame(None, encoded['x_hat'])
@@ -502,3 +502,55 @@ def main():
                 cur_args['src_width'] = config[ds_name]['sequences'][seq]['width']
 
                 cur_args['intra_period'] = config[ds_name]['sequences'][seq]['intra_period']
+                if args.force_intra:
+                    cur_args['intra_period'] = 1
+                if args.force_intra_period > 0:
+                    cur_args['intra_period'] = args.force_intra_period
+
+                cur_args['frame_num'] = config[ds_name]['sequences'][seq]['frames']
+                if args.force_frame_num > 0:
+                    cur_args['frame_num'] = args.force_frame_num
+
+                cur_args['calc_ssim'] = args.calc_ssim
+                cur_args['dataset_path'] = os.path.join(root_path, config[ds_name]['base_path'])
+                cur_args['write_stream'] = args.write_stream
+                cur_args['check_existing'] = args.check_existing
+                cur_args['stream_path'] = args.stream_path
+                cur_args['save_decoded_frame'] = args.save_decoded_frame
+                cur_args['ds_name'] = ds_name
+                cur_args['verbose'] = args.verbose
+                cur_args['verbose_json'] = args.verbose_json
+
+                count_frames += cur_args['frame_num']
+                obj = threadpool_executor.submit(worker, cur_args)
+                objs.append(obj)
+
+    results = []
+    for obj in tqdm(objs):
+        result = obj.result()
+        results.append(result)
+
+    log_result = {}
+    for ds_name in config:
+        if config[ds_name]['test'] == 0:
+            continue
+        log_result[ds_name] = {}
+        for seq in config[ds_name]['sequences']:
+            log_result[ds_name][seq] = {}
+            for res in results:
+                log_result[res['ds_name']][res['seq']][f"{res['rate_idx']:03d}"] = res
+
+    out_json_dir = os.path.dirname(args.output_path)
+    if len(out_json_dir) > 0:
+        create_folder(out_json_dir, True)
+    with open(args.output_path, 'w') as fp:
+        dump_json(log_result, fp, float_digits=6, indent=2)
+
+    total_minutes = (time.time() - begin_time) / 60
+    print('Test finished')
+    print(f'Tested {count_frames} frames from {count_sequences} sequences')
+    print(f'Total elapsed time: {total_minutes:.1f} min')
+
+
+if __name__ == "__main__":
+    main()
